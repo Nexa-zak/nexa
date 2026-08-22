@@ -1,0 +1,16 @@
+name = "nexa"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+# ─── متغیرهای اختیاری (می‌توانید در داشبورد Cloudflare هم تنظیم کنید) ───
+# [vars]
+# UUID = "your-uuid-here"        # UUID ثابت برای حالت بدون KV
+# PASSWORD = "your-panel-pass"   # رمز ورود به پنل (پیش‌فرض: nexa)
+# PROXYIP = "1.2.3.4"            # برای اتصال به سایت‌های پشت کلادفلر
+# WS_PATH = "/ws"                # مسیر وب‌سوکت (پیش‌فرض: /ws)
+
+# ─── KV اختیاری: برای مدیریت کاربران و ذخیره تنظیمات ───
+# بعد از ساخت KV در داشبورد، شناسه آن را جایگزین کنید:
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "<your-kv-namespace-id>"
