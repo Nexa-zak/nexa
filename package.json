@@ -1,6 +1,6 @@
 {
   "name": "nexa",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Nexa — VLESS proxy & subscription panel on Cloudflare Workers",
   "private": true,
   "type": "module",
@@ -8,12 +8,15 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test:qr": "node scripts/qr-test.mjs",
+    "test:png": "node scripts/png-test.mjs",
+    "test:bot": "node scripts/bot-test.mjs",
     "test:e2e": "node scripts/e2e-suite.mjs",
     "test:vless": "node scripts/vless-test.mjs"
   },
   "devDependencies": {
     "jsqr": "^1.4.0",
-    "ws": "^8.18.0",
-    "wrangler": "^4.0.0"
+    "pngjs": "^7.0.0",
+    "wrangler": "^4.0.0",
+    "ws": "^8.18.0"
   }
 }

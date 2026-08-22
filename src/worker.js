@@ -19,8 +19,9 @@
 
 import { connect } from 'cloudflare:sockets';
 import { makeQR } from './qr.js';
+import { handleTelegramUpdate, webhookSecret } from './bot.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 const DEFAULT_CLEAN_IPS = [
   '104.17.147.22',
@@ -224,6 +225,12 @@ async function cookieToken(env, settings) {
 }
 
 async function isAuthed(request, env, settings) {
+  // machine-to-machine auth (e.g. tools) via X-Nexa-Key header
+  const key = request.headers.get('x-nexa-key');
+  if (key) {
+    const hash = await sha256Hex('nexa:pw:' + key);
+    return timingSafeEq(hash, await effectivePwHash(env, settings));
+  }
   const m = (request.headers.get('cookie') || '').match(/nexa_session=([a-f0-9]{64})/);
   if (!m) return false;
   return timingSafeEq(m[1], await cookieToken(env, settings));
@@ -801,6 +808,15 @@ function renderSettings() {
   document.getElementById('wsPath').value = state.settings.wsPath || '/ws';
   document.getElementById('cleanIPs').value = (state.settings.cleanIPs || []).join('\\n');
   document.getElementById('kvWarn').style.display = state.kv ? 'none' : 'block';
+  var bc = document.getElementById('botCard');
+  if (state.bot && state.bot.enabled) {
+    bc.style.display = 'block';
+    document.getElementById('botStatus').textContent = state.bot.webhookUrl
+      ? 'وضعیت: متصل — ' + state.bot.webhookUrl
+      : 'توکن ربات تنظیم شده اما وب‌هوک هنوز ساخته نشده — روی «اتصال ربات» بزنید.';
+  } else {
+    bc.style.display = 'none';
+  }
 }
 function loadAll() {
   return api('/api/state').then(function(j){
@@ -878,6 +894,21 @@ document.addEventListener('DOMContentLoaded', function(){
   document.getElementById('qrmodal').onclick = function(e){
     if (e.target === this) this.classList.remove('show');
   };
+  document.getElementById('botConnect').onclick = function(){
+    api('/api/bot/setwebhook', {method:'POST'})
+      .then(function(j){
+        if (j.ok) { toast('ربات متصل شد ✓'); loadAll(); }
+        else toast(j.error || 'خطا در اتصال ربات');
+      });
+  };
+  document.getElementById('botRefresh').onclick = function(){
+    api('/api/bot/status').then(function(j){
+      var info = j.telegram || {};
+      var txt = 'فعال: ' + (j.enabled ? 'بله' : 'خیر');
+      if (info.url) txt += ' | وب‌هوک: ' + info.url + ' | در انتظار: ' + (info.pending_update_count || 0);
+      document.getElementById('botStatus').textContent = txt;
+    });
+  };
   loadAll();
 });
 `.trim();
@@ -928,6 +959,15 @@ function panelPage(host) {
 </div>
 <div class="page" id="pg-settings" style="display:none">
   <div id="kvWarn" class="card" style="border-color:rgba(250,204,21,.4);display:none"><b style="color:#facc15">⚠ حافظه KV متصل نیست</b><p class="hint">بدون KV فقط یک کاربر (از متغیر UUID) پشتیبانی می‌شود و تغییرات تنظیمات و مدیریت کاربران غیرفعال است. راهنمای اتصال KV در README ریپازیتوری.</p></div>
+  <div class="card" id="botCard" style="display:none">
+    <h3>🤖 ربات تلگرام</h3>
+    <div id="botStatus" class="hint">—</div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn primary" type="button" id="botConnect">🔌 اتصال ربات به تلگرام</button>
+      <button class="btn" type="button" id="botRefresh">🔄 وضعیت</button>
+    </div>
+    <p class="hint">پس از اتصال، در تلگرام ربات را /start کنید و رمز همین پنل را بفرستید تا منوی مدیریت و لینک‌های اختصاصی هر کاربر نمایش داده شود.</p>
+  </div>
   <div class="card">
     <h3>تنظیمات</h3>
     <form id="saveSettings">
@@ -1011,6 +1051,22 @@ async function route(request, env, ctx) {
   // public sub endpoints
   if (path.startsWith('/sub/')) return handleSub(request, env, path.slice(5).split('/')[0], url.searchParams.get('format') || 'v2ray');
 
+  // Telegram webhook (only reachable with the correct secret + header token)
+  if (path.startsWith('/tg/')) {
+    const secret = path.slice(4).split('/')[0];
+    const expect = await webhookSecret(env);
+    if (!expect || !timingSafeEq(secret, expect)) return new Response('Not found', { status: 404 });
+    if (request.method !== 'POST') return new Response('ok', { status: 200 });
+    const hdrSecret = request.headers.get('x-telegram-bot-api-secret-token') || '';
+    if (!timingSafeEq(hdrSecret, expect)) return new Response('Not found', { status: 404 });
+    let update = null;
+    try { update = await request.json(); } catch {}
+    if (update && env.TELEGRAM_BOT_TOKEN) {
+      ctx.waitUntil(handleTelegramUpdate(update, env, ctx).catch(() => {}));
+    }
+    return new Response('', { status: 200 });
+  }
+
   const settings = await loadSettings(env);
 
   if (path === '/login' && request.method === 'POST') {
@@ -1047,12 +1103,18 @@ async function route(request, env, ctx) {
     if (path === '/api/state' && request.method === 'GET') {
       const users = await loadUsers(env, host);
       const token = await ensureSubToken(env, settings, host);
+      const botEnabled = !!env.TELEGRAM_BOT_TOKEN;
+      let botWebhook = null;
+      if (botEnabled && settings.botHost) {
+        botWebhook = `https://${settings.botHost}/tg/${await webhookSecret(env)}`;
+      }
       return json({
         ok: true,
         host,
         version: VERSION,
         kv: !!env.KV,
         defaultPassword: usingDefaultPassword(env, settings),
+        bot: { enabled: botEnabled, webhookUrl: botWebhook },
         settings: {
           wsPath: settings.wsPath,
           proxyIP: settings.proxyIP,
@@ -1145,6 +1207,37 @@ async function route(request, env, ctx) {
       return json({ ok: true, token: t });
     }
 
+    // bot management endpoints (panel-authenticated)
+    if (path === '/api/bot/setwebhook' && request.method === 'POST') {
+      if (!env.TELEGRAM_BOT_TOKEN) return json({ ok: false, error: 'متغیر TELEGRAM_BOT_TOKEN روی ورکر تنظیم نشده است' }, 409);
+      const secret = await webhookSecret(env);
+      const hookUrl = `https://${host}/tg/${secret}`;
+      const r = await telegramCall(env, 'setWebhook', {
+        url: hookUrl,
+        allowed_updates: ['message', 'callback_query'],
+        secret_token: secret,
+        drop_pending_updates: true
+      });
+      if (!r || !r.ok) return json({ ok: false, error: (r && r.description) || 'Telegram API error' }, 502);
+      await saveSettingsPatch(env, { botHost: host });
+      const c = await telegramCall(env, 'setMyCommands', { commands: BOT_COMMANDS });
+      return json({ ok: true, webhook: hookUrl, commandsSet: !!(c && c.ok) });
+    }
+
+    if (path === '/api/bot/status' && request.method === 'GET') {
+      if (!env.TELEGRAM_BOT_TOKEN) return json({ ok: true, enabled: false });
+      const r = await telegramCall(env, 'getWebhookInfo', {});
+      const settingsNow = await loadSettings(env);
+      const secret = await webhookSecret(env);
+      return json({
+        ok: true,
+        enabled: true,
+        host: settingsNow.botHost || null,
+        expectedWebhook: settingsNow.botHost ? `https://${settingsNow.botHost}/tg/${secret}` : null,
+        telegram: r && r.result ? r.result : null
+      });
+    }
+
     return json({ error: 'not found' }, 404);
   }
 
@@ -1160,3 +1253,58 @@ export default {
     }
   }
 };
+
+// shared panel logic used by the Telegram bot (circular ESM — live bindings)
+export {
+  sha256Hex,
+  randomHex,
+  genUuid,
+  timingSafeEq,
+  json,
+  loadSettings,
+  saveSettingsPatch,
+  effectivePwHash,
+  usingDefaultPassword,
+  loadUsers,
+  saveUsers,
+  bumpUsage,
+  userStatus,
+  ensureSubToken,
+  cookieToken,
+  buildUserLinks,
+  vlessLink,
+  clashYaml,
+  singboxConfig
+};
+
+// ─────────────────── telegram bot endpoints ───────────────────
+
+async function telegramCall(env, method, payload) {
+  if (!env.TELEGRAM_BOT_TOKEN) return null;
+  const api = env.TELEGRAM_API || 'https://api.telegram.org';
+  try {
+    const r = await fetch(api + '/bot' + env.TELEGRAM_BOT_TOKEN + '/' + method, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, description: (e && e.message) || 'network error' };
+  }
+}
+
+const BOT_COMMANDS = [
+  { command: 'start', description: 'شروع و ورود به پنل' },
+  { command: 'menu', description: 'منوی اصلی' },
+  { command: 'links', description: 'کانکشن‌های من' },
+  { command: 'sub', description: 'لینک‌های اشتراک' },
+  { command: 'status', description: 'وضعیت و مصرف من' },
+  { command: 'users', description: 'مدیریت کاربران' },
+  { command: 'add', description: 'افزودن کاربر' },
+  { command: 'token', description: 'توکن اشتراک جدید' },
+  { command: 'proxyip', description: 'تغییر ProxyIP' },
+  { command: 'ips', description: 'ویرایش IPهای تمیز' },
+  { command: 'help', description: 'راهنما' },
+  { command: 'logout', description: 'خروج از ربات' }
+];
